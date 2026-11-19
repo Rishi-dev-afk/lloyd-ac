@@ -1,0 +1,630 @@
+name: Build Voltas AC app
+on:
+  push:
+  workflow_dispatch:
+permissions:
+  contents: write
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: "17"
+      - uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: "8.7"
+      - name: Generate project files
+        run: |
+          cat > settings.gradle.kts << 'FILE_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement { repositories { google(); mavenCentral() } }
+          rootProject.name = "VoltasAC"
+          include(":app")
+          FILE_EOF
+          cat > build.gradle.kts << 'FILE_EOF'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FILE_EOF
+          cat > gradle.properties << 'FILE_EOF'
+          android.useAndroidX=true
+          org.gradle.jvmargs=-Xmx2g
+          FILE_EOF
+          mkdir -p app
+          cat > app/build.gradle.kts << 'FILE_EOF'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+          android {
+              namespace = "com.example.acremote"
+              compileSdk = 34
+              defaultConfig {
+                  applicationId = "com.example.acremote"
+                  minSdk = 26
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = "17" }
+          }
+          dependencies { implementation("androidx.appcompat:appcompat:1.6.1") }
+          FILE_EOF
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml << 'FILE_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.TRANSMIT_IR" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+              <uses-feature android:name="android.hardware.consumerir" android:required="true" />
+              <application
+                  android:label="Voltas AC"
+                  android:icon="@drawable/ic_launcher"
+                  android:theme="@style/Theme.AppCompat.DayNight.NoActionBar">
+                  <activity android:name=".MainActivity" android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          FILE_EOF
+          mkdir -p app/src/main/res/drawable
+          cat > app/src/main/res/drawable/ic_launcher.xml << 'FILE_EOF'
+          <vector xmlns:android="http://schemas.android.com/apk/res/android"
+              android:width="108dp" android:height="108dp"
+              android:viewportWidth="108" android:viewportHeight="108">
+              <path android:fillColor="#1565C0" android:pathData="M0,0h108v108h-108z"/>
+              <path android:strokeColor="#FFFFFF" android:strokeWidth="6"
+                  android:pathData="M54,22L54,86M26,38L82,70M26,70L82,38"/>
+          </vector>
+          FILE_EOF
+          mkdir -p app/src/main/java/com/example/acremote
+          cat > app/src/main/java/com/example/acremote/MainActivity.kt << 'FILE_EOF'
+          package com.example.acremote
+
+          import android.content.Context
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.graphics.drawable.StateListDrawable
+          import android.hardware.ConsumerIrManager
+          import android.os.Bundle
+          import android.os.Handler
+          import android.os.Looper
+          import android.os.VibrationEffect
+          import android.os.Vibrator
+          import android.view.Gravity
+          import android.view.View
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.TextView
+          import android.widget.Toast
+          import androidx.appcompat.app.AppCompatActivity
+          import java.text.SimpleDateFormat
+          import java.util.Date
+          import java.util.Locale
+
+          /** Gree IR protocol (used by Voltas remotes with BLOW / TURBO / LIGHT buttons). */
+          object Gree {
+              // mode index == Gree mode value: 0 AUTO, 1 COOL, 2 DRY, 3 FAN
+              fun state(
+                  power: Boolean, mode: Int, temp: Int, fan: Int, swing: Boolean,
+                  turbo: Boolean, sleep: Boolean, light: Boolean, blow: Boolean, disp: Int
+              ): IntArray {
+                  val b = IntArray(8)
+                  b[0] = mode or (if (power) 0x08 else 0) or (fan shl 4) or
+                      (if (swing) 0x40 else 0) or (if (sleep) 0x80 else 0)
+                  b[1] = (temp.coerceIn(16, 30) - 16) and 0x0F
+                  b[2] = (if (turbo) 0x10 else 0) or (if (light) 0x20 else 0) or (if (blow) 0x80 else 0)
+                  b[3] = 0x50
+                  b[4] = if (swing) 0x01 else 0x00
+                  b[5] = 0x20 or (disp and 0x03)
+                  b[6] = 0
+                  var sum = 10
+                  for (i in 0..3) sum += b[i] and 0x0F
+                  for (i in 4..6) sum += (b[i] shr 4) and 0x0F
+                  b[7] = (sum and 0x0F) shl 4
+                  return b
+              }
+
+              fun pattern(b: IntArray): IntArray {
+                  val p = ArrayList<Int>()
+                  fun bit(v: Int) {
+                      p.add(620)
+                      p.add(if (v == 1) 1600 else 540)
+                  }
+                  fun byteLsb(x: Int) {
+                      for (i in 0..7) bit((x shr i) and 1)
+                  }
+                  p.add(9000); p.add(4500)
+                  for (i in 0..3) byteLsb(b[i])
+                  bit(0); bit(1); bit(0)          // 3-bit footer 0b010
+                  p.add(620); p.add(19980)        // gap between the two blocks
+                  for (i in 4..7) byteLsb(b[i])
+                  p.add(620); p.add(20000)
+                  return p.toIntArray()
+              }
+          }
+
+          class MainActivity : AppCompatActivity() {
+              private val MODE_NAMES = listOf("AUTO", "COOL ❄", "DRY", "FAN")
+              private val FAN_NAMES = listOf("AUTO", "LOW", "MED", "HIGH")
+              private val DISP_NAMES = listOf("OFF", "SET", "INDOOR", "OUTDOOR")
+
+              private var ir: ConsumerIrManager? = null
+              private val handler = Handler(Looper.getMainLooper())
+              private val prefs by lazy { getSharedPreferences("voltas", Context.MODE_PRIVATE) }
+
+              private var power = false
+              private var temp = 24
+              private var mode = 1
+              private var fan = 0
+              private var swing = false
+              private var turbo = false
+              private var sleep = false
+              private var light = true
+              private var blow = false
+              private var disp = 1
+              private var lastLabel = ""
+              private var lastHex = ""
+              private var log = mutableListOf<String>()
+
+              private lateinit var lcd: LinearLayout
+              private lateinit var modeText: TextView
+              private lateinit var tempText: TextView
+              private lateinit var unitText: TextView
+              private lateinit var fanLabel: TextView
+              private lateinit var flagsText: TextView
+              private lateinit var bars: List<View>
+              private lateinit var txDot: TextView
+              private lateinit var txText: TextView
+              private lateinit var timeText: TextView
+              private lateinit var stateText: TextView
+              private lateinit var logText: TextView
+              private lateinit var chips: List<TextView>
+
+              // ---------- small UI helpers ----------
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+              private fun c(s: String) = Color.parseColor(s)
+
+              private fun rounded(color: Int, r: Int, stroke: Int = 0, strokeColor: Int = 0) =
+                  GradientDrawable().apply {
+                      setColor(color)
+                      cornerRadius = dp(r).toFloat()
+                      if (stroke > 0) setStroke(dp(stroke), strokeColor)
+                  }
+
+              private fun shade(col: Int) = Color.rgb(
+                  (Color.red(col) * 0.85).toInt(), (Color.green(col) * 0.85).toInt(), (Color.blue(col) * 0.85).toInt()
+              )
+
+              private fun keyBg(color: Int, r: Int) = StateListDrawable().apply {
+                  addState(intArrayOf(android.R.attr.state_pressed), rounded(shade(color), r, 2, c("#8A8472")))
+                  addState(intArrayOf(), rounded(color, r, 2, c("#8A8472")))
+              }
+
+              private fun label(t: String, size: Float, color: String = "#2B2B2B", bold: Boolean = false) =
+                  TextView(this).apply {
+                      text = t
+                      textSize = size
+                      setTextColor(c(color))
+                      gravity = Gravity.CENTER
+                      if (bold) typeface = Typeface.DEFAULT_BOLD
+                  }
+
+              private fun key(t: String, size: Float = 13f, r: Int = 8, click: () -> Unit) =
+                  label(t, size).apply {
+                      background = keyBg(c("#E9E2CE"), r)
+                      isClickable = true
+                      setOnClickListener { click() }
+                  }
+
+              private fun hrow() = LinearLayout(this).apply { orientation = LinearLayout.HORIZONTAL }
+              private fun vcol() = LinearLayout(this).apply { orientation = LinearLayout.VERTICAL }
+
+              private fun LinearLayout.addH(v: View, weight: Float, h: Int) {
+                  addView(v, LinearLayout.LayoutParams(0, dp(h), weight).apply { setMargins(dp(6), dp(6), dp(6), dp(6)) })
+              }
+
+              private fun LinearLayout.spacer(weight: Float, h: Int) {
+                  addView(View(this@MainActivity), LinearLayout.LayoutParams(0, dp(h), weight))
+              }
+
+              // ---------- screens ----------
+              private fun buildLcd(): LinearLayout {
+                  val frame = vcol()
+                  frame.background = rounded(c("#BFC4C2"), 10, 3, c("#98A09C"))
+                  frame.setPadding(dp(8), dp(8), dp(8), dp(8))
+                  lcd = vcol()
+                  lcd.background = rounded(c("#A9AFA4"), 4, 2, c("#6E7468"))
+                  lcd.setPadding(dp(12), dp(8), dp(12), dp(8))
+
+                  modeText = label("", 15f, "#222222", true)
+                  modeText.gravity = Gravity.START
+                  lcd.addView(modeText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  val line = View(this)
+                  line.setBackgroundColor(c("#6E7468"))
+                  lcd.addView(line, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)))
+
+                  val tr = hrow()
+                  tr.gravity = Gravity.CENTER
+                  tempText = label("24", 72f, "#222222", true)
+                  tempText.typeface = Typeface.create(Typeface.MONOSPACE, Typeface.BOLD)
+                  unitText = label("°C", 20f, "#222222", true)
+                  unitText.gravity = Gravity.TOP
+                  tr.addView(tempText)
+                  tr.addView(unitText)
+                  lcd.addView(tr)
+
+                  val fanRow = hrow()
+                  fanRow.gravity = Gravity.BOTTOM
+                  fanRow.addView(label("FAN", 12f, "#222222", true))
+                  val list = mutableListOf<View>()
+                  for (i in 1..3) {
+                      val b = View(this)
+                      fanRow.addView(b, LinearLayout.LayoutParams(dp(14), dp(6 + 5 * i)).apply { setMargins(dp(6), 0, 0, 0) })
+                      list.add(b)
+                  }
+                  bars = list
+                  fanLabel = label("", 12f, "#222222", true)
+                  fanLabel.setPadding(dp(8), 0, 0, 0)
+                  fanRow.addView(fanLabel)
+                  lcd.addView(fanRow)
+
+                  val line2 = View(this)
+                  line2.setBackgroundColor(c("#6E7468"))
+                  lcd.addView(line2, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(1)).apply { setMargins(0, dp(6), 0, dp(4)) })
+                  flagsText = label("", 11f, "#222222", true)
+                  flagsText.gravity = Gravity.START
+                  lcd.addView(flagsText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  frame.addView(lcd)
+                  return frame
+              }
+
+              private fun buildRemote(): LinearLayout {
+                  val body = vcol()
+                  body.background = rounded(c("#EEF0EC"), 30, 2, c("#D2D5CF"))
+                  body.setPadding(dp(14), dp(18), dp(14), dp(18))
+
+                  body.addView(buildLcd(), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      setMargins(dp(4), 0, dp(4), dp(16))
+                  })
+
+                  val r1 = hrow()
+                  r1.addH(key("ON/OFF", 14f, 24) { onOff() }, 1f, 46)
+                  r1.addH(key("MODE", 14f, 24) { changeMode() }, 1f, 46)
+                  body.addView(r1)
+
+                  val r2 = hrow()
+                  r2.spacer(0.35f, 46)
+                  r2.addH(key("−", 22f) { changeTemp(-1) }, 1f, 46)
+                  r2.addH(key("+", 22f) { changeTemp(1) }, 1f, 46)
+                  r2.spacer(0.35f, 46)
+                  body.addView(r2)
+
+                  val r3 = hrow()
+                  r3.addH(key("FAN", 12f) { changeFan() }, 1f, 38)
+                  r3.spacer(0.4f, 38)
+                  r3.addH(key("≡|", 16f) { toggleSwing() }, 1f, 38)
+                  body.addView(r3)
+
+                  val r4 = hrow()
+                  r4.addH(key("CLOCK", 12f) { unmapped("CLOCK") }, 1f, 38)
+                  r4.spacer(0.4f, 38)
+                  r4.addH(key("TIMER ON", 11f) { unmapped("TIMER ON") }, 1f, 38)
+                  body.addView(r4)
+
+                  val r5 = hrow()
+                  r5.addH(key("BLOW", 12f) { toggleBlow() }, 1f, 38)
+                  r5.addH(key("TEMP", 12f) { cycleDisp() }, 1f, 38)
+                  r5.addH(key("TIMER OFF", 10f) { unmapped("TIMER OFF") }, 1f, 38)
+                  body.addView(r5)
+
+                  val r6 = hrow()
+                  r6.addH(key("TURBO", 12f) { toggleTurbo() }, 1f, 38)
+                  r6.addH(key("SLEEP", 12f) { toggleSleep() }, 1f, 38)
+                  r6.addH(key("LIGHT", 12f) { toggleLight() }, 1f, 38)
+                  body.addView(r6)
+
+                  val logo = label("VOLTAS", 30f, "#1565C0", true)
+                  logo.setTypeface(Typeface.DEFAULT_BOLD, Typeface.BOLD_ITALIC)
+                  logo.setPadding(0, dp(24), 0, dp(4))
+                  body.addView(logo, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+                  return body
+              }
+
+              private fun buildStatus(): LinearLayout {
+                  val card = vcol()
+                  card.background = rounded(c("#0F1317"), 14)
+                  card.setPadding(dp(14), dp(12), dp(14), dp(12))
+
+                  val head = hrow()
+                  head.gravity = Gravity.CENTER_VERTICAL
+                  txDot = label("●", 16f, "#43A047")
+                  txText = label("READY", 14f, "#FFFFFF", true)
+                  txText.gravity = Gravity.START or Gravity.CENTER_VERTICAL
+                  timeText = label("", 12f, "#8A939C")
+                  head.addView(txDot)
+                  head.addView(txText, LinearLayout.LayoutParams(0, LinearLayout.LayoutParams.WRAP_CONTENT, 1f).apply { setMargins(dp(8), 0, 0, 0) })
+                  head.addView(timeText)
+                  card.addView(head)
+
+                  stateText = label("", 13f, "#CFD8DC")
+                  stateText.gravity = Gravity.START
+                  stateText.setPadding(0, dp(8), 0, dp(8))
+                  card.addView(stateText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  val chipRow = hrow()
+                  val list = mutableListOf<TextView>()
+                  for (name in listOf("SLEEP", "TURBO", "LIGHT", "BLOW", "SWING")) {
+                      val ch = label(name, 10f, "#78808A", true)
+                      ch.setPadding(dp(7), dp(4), dp(7), dp(4))
+                      chipRow.addView(ch, LinearLayout.LayoutParams(LinearLayout.LayoutParams.WRAP_CONTENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                          setMargins(0, 0, dp(5), 0)
+                      })
+                      list.add(ch)
+                  }
+                  chips = list
+                  card.addView(chipRow)
+
+                  logText = label("", 11f, "#8A939C")
+                  logText.gravity = Gravity.START
+                  logText.typeface = Typeface.MONOSPACE
+                  logText.setPadding(0, dp(10), 0, dp(6))
+                  card.addView(logText, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  val note = label("IR is one-way: the AC cannot reply. Its beep means it received the command.", 11f, "#6B747D")
+                  note.gravity = Gravity.START
+                  card.addView(note, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT))
+
+                  val resend = label("↻  Resend last command", 12f, "#FFFFFF")
+                  resend.background = rounded(c("#2A2F36"), 10)
+                  resend.isClickable = true
+                  resend.setOnClickListener { resendLast() }
+                  card.addView(resend, LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, dp(40)).apply { setMargins(0, dp(10), 0, 0) })
+                  return card
+              }
+
+              // ---------- lifecycle ----------
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+                  ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+                  load()
+
+                  val root = vcol()
+                  root.setPadding(dp(14), dp(18), dp(14), dp(24))
+                  root.addView(buildStatus(), LinearLayout.LayoutParams(LinearLayout.LayoutParams.MATCH_PARENT, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      setMargins(0, 0, 0, dp(14))
+                  })
+                  val w = minOf(dp(330), resources.displayMetrics.widthPixels - dp(28))
+                  root.addView(buildRemote(), LinearLayout.LayoutParams(w, LinearLayout.LayoutParams.WRAP_CONTENT).apply {
+                      gravity = Gravity.CENTER_HORIZONTAL
+                  })
+                  val sv = ScrollView(this)
+                  sv.setBackgroundColor(c("#1B1D20"))
+                  sv.addView(root)
+                  setContentView(sv)
+
+                  if (ir?.hasIrEmitter() == true) setStatus("READY", "#43A047") else setStatus("NO IR BLASTER FOUND", "#E53935")
+                  render()
+              }
+
+              // ---------- state ----------
+              private fun load() {
+                  power = prefs.getBoolean("power", false)
+                  temp = prefs.getInt("temp", 24)
+                  mode = prefs.getInt("mode", 1)
+                  fan = prefs.getInt("fan", 0)
+                  swing = prefs.getBoolean("swing", false)
+                  turbo = prefs.getBoolean("turbo", false)
+                  sleep = prefs.getBoolean("sleep", false)
+                  light = prefs.getBoolean("light", true)
+                  blow = prefs.getBoolean("blow", false)
+                  disp = prefs.getInt("disp", 1)
+                  lastLabel = prefs.getString("lastLabel", "") ?: ""
+                  lastHex = prefs.getString("lastHex", "") ?: ""
+                  log = (prefs.getString("log", "") ?: "").split("\n").filter { it.isNotBlank() }.toMutableList()
+              }
+
+              private fun save() {
+                  prefs.edit()
+                      .putBoolean("power", power).putInt("temp", temp).putInt("mode", mode).putInt("fan", fan)
+                      .putBoolean("swing", swing).putBoolean("turbo", turbo).putBoolean("sleep", sleep)
+                      .putBoolean("light", light).putBoolean("blow", blow).putInt("disp", disp)
+                      .putString("lastLabel", lastLabel).putString("lastHex", lastHex)
+                      .putString("log", log.joinToString("\n"))
+                      .apply()
+              }
+
+              private fun render() {
+                  lcd.alpha = if (power) 1f else 0.12f
+                  modeText.text = MODE_NAMES[mode]
+                  val fanOnly = mode == 3
+                  tempText.text = if (fanOnly) "--" else temp.toString()
+                  unitText.text = if (fanOnly) "" else "°C"
+                  fanLabel.text = if (fan == 0) "AUTO" else ""
+                  val level = if (fan == 0) 3 else fan
+                  for (i in bars.indices) {
+                      val col = if (i < level) (if (fan == 0) "#6E7468" else "#222222") else "#98A090"
+                      bars[i].setBackgroundColor(c(col))
+                  }
+                  val active = mutableListOf<String>()
+                  if (sleep) active.add("SLEEP")
+                  if (turbo) active.add("TURBO")
+                  if (light) active.add("LIGHT")
+                  if (blow) active.add("BLOW")
+                  if (swing) active.add("SWING")
+                  flagsText.text = active.joinToString("  ")
+
+                  val tempStr = if (fanOnly) "--" else "$temp°C"
+                  stateText.text = if (power)
+                      "AC ON · ${MODE_NAMES[mode]} · $tempStr · FAN ${FAN_NAMES[fan]} · DISP ${DISP_NAMES[disp]}"
+                  else "AC OFF"
+
+                  val flags = listOf(sleep, turbo, light, blow, swing)
+                  val lit = listOf("#7E57C2", "#EF6C00", "#FBC02D", "#00897B", "#1E88E5")
+                  for (i in chips.indices) {
+                      val on = flags[i]
+                      chips[i].setTextColor(if (on) Color.WHITE else c("#78808A"))
+                      chips[i].background = rounded(if (on) c(lit[i]) else c("#2A2F36"), 8)
+                  }
+                  logText.text = if (log.isEmpty()) "No commands sent yet" else log.joinToString("\n")
+              }
+
+              private fun setStatus(text: String, color: String) {
+                  handler.removeCallbacksAndMessages(null)
+                  txDot.setTextColor(c(color))
+                  txText.text = text
+              }
+
+              // ---------- sending ----------
+              private fun buzz() {
+                  try {
+                      val v = getSystemService(Context.VIBRATOR_SERVICE) as Vibrator
+                      v.vibrate(VibrationEffect.createOneShot(25, VibrationEffect.DEFAULT_AMPLITUDE))
+                  } catch (e: Exception) {
+                  }
+              }
+
+              private fun hex(b: IntArray) = b.joinToString(" ") { String.format("%02X", it) }
+
+              private fun transmit(label: String, bytes: IntArray) {
+                  val irm = ir
+                  if (irm == null || !irm.hasIrEmitter()) {
+                      setStatus("NO IR BLASTER FOUND", "#E53935")
+                      render()
+                      return
+                  }
+                  try {
+                      irm.transmit(38000, Gree.pattern(bytes))
+                  } catch (e: Exception) {
+                      setStatus("FAILED: ${e.message}", "#E53935")
+                      render()
+                      return
+                  }
+                  lastLabel = label
+                  lastHex = hex(bytes)
+                  val t = SimpleDateFormat("HH:mm:ss", Locale.getDefault()).format(Date())
+                  log.add(0, t + "  " + label + "\n          " + lastHex)
+                  while (log.size > 5) log.removeAt(log.size - 1)
+                  timeText.text = t
+                  setStatus("TRANSMITTING…", "#FF9800")
+                  handler.postDelayed({ setStatus("SENT ✓  $label", "#43A047") }, 450)
+                  buzz()
+                  save()
+                  render()
+              }
+
+              private fun sendState(label: String) {
+                  transmit(label, Gree.state(power, mode, temp, fan, swing, turbo, sleep, light, blow, disp))
+              }
+
+              private fun resendLast() {
+                  if (lastHex.isEmpty()) {
+                      Toast.makeText(this, "Nothing to resend yet", Toast.LENGTH_SHORT).show()
+                      return
+                  }
+                  val bytes = lastHex.split(" ").map { it.toInt(16) }.toIntArray()
+                  transmit("RESEND $lastLabel", bytes)
+              }
+
+              private fun needOn(): Boolean {
+                  if (power) return false
+                  setStatus("AC is OFF - press ON/OFF first", "#FFB300")
+                  return true
+              }
+
+              private fun unmapped(name: String) {
+                  setStatus("$name: not supported in this app yet", "#FFB300")
+                  Toast.makeText(this, "$name isn't supported yet", Toast.LENGTH_SHORT).show()
+              }
+
+              // ---------- button actions ----------
+              private fun onOff() {
+                  power = !power
+                  if (!power) {
+                      turbo = false
+                      sleep = false
+                  }
+                  sendState(if (power) "POWER ON" else "POWER OFF")
+              }
+
+              private fun changeTemp(d: Int) {
+                  if (needOn()) return
+                  if (mode == 3) {
+                      setStatus("Temperature not used in FAN mode", "#FFB300")
+                      return
+                  }
+                  temp = (temp + d).coerceIn(16, 30)
+                  sendState("TEMP $temp°C")
+              }
+
+              private fun changeMode() {
+                  if (needOn()) return
+                  mode = (mode + 1) % 4
+                  sendState("MODE " + MODE_NAMES[mode])
+              }
+
+              private fun changeFan() {
+                  if (needOn()) return
+                  fan = (fan + 1) % 4
+                  sendState("FAN " + FAN_NAMES[fan])
+              }
+
+              private fun toggleSwing() {
+                  if (needOn()) return
+                  swing = !swing
+                  sendState(if (swing) "SWING ON" else "SWING OFF")
+              }
+
+              private fun toggleBlow() {
+                  if (needOn()) return
+                  blow = !blow
+                  sendState(if (blow) "BLOW ON" else "BLOW OFF")
+              }
+
+              private fun toggleTurbo() {
+                  if (needOn()) return
+                  turbo = !turbo
+                  sendState(if (turbo) "TURBO ON" else "TURBO OFF")
+              }
+
+              private fun toggleSleep() {
+                  if (needOn()) return
+                  sleep = !sleep
+                  sendState(if (sleep) "SLEEP ON" else "SLEEP OFF")
+              }
+
+              private fun toggleLight() {
+                  if (needOn()) return
+                  light = !light
+                  sendState(if (light) "LIGHT ON" else "LIGHT OFF")
+              }
+
+              private fun cycleDisp() {
+                  if (needOn()) return
+                  disp = (disp + 1) % 4
+                  sendState("DISPLAY " + DISP_NAMES[disp])
+              }
+          }
+          FILE_EOF
+
+      - name: Build APK
+        run: gradle assembleDebug --no-daemon
+      - name: Publish APK as a release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cp app/build/outputs/apk/debug/app-debug.apk VoltasAC.apk
+          gh release create "build-${{ github.run_number }}" VoltasAC.apk --title "Voltas AC build ${{ github.run_number }}" --notes "Install VoltasAC.apk"
